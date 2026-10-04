@@ -24,7 +24,11 @@ class Features:
     hip: float | None           # 엉덩이 각도 (어깨-엉덩이-무릎)
     torso: float | None         # 상체가 수직에서 기울어진 각도
     wrist_above_hip: bool
-    foot_above_knee: bool
+    foot_gap: float | None      # (반대쪽 무릎 y - 발 최상단 y) / 박스 높이. 양수면 발이 무릎보다 위
+
+    @property
+    def foot_above_knee(self):
+        return self.foot_gap is not None and self.foot_gap >= FOOT_MARGIN
 
 
 def calculate_angle(a, b, c):
@@ -60,19 +64,22 @@ def extract_features(pts, conf, box_h):
         ys = [pts[n][1] for n in (f'{side}_ankle', f'{side}_heel', f'{side}_foot') if ok(n)]
         return min(ys) if ys else None
 
-    margin = FOOT_MARGIN * box_h
-    foot_above_knee = False
+    gaps = []
     for foot_side, knee_side in (('l', 'r'), ('r', 'l')):
         fy = foot_top(foot_side)
-        if fy is not None and ok(f'{knee_side}_knee') and fy < pts[f'{knee_side}_knee'][1] - margin:
-            foot_above_knee = True
+        if fy is not None and ok(f'{knee_side}_knee') and box_h > 0:
+            gaps.append((pts[f'{knee_side}_knee'][1] - fy) / box_h)
+    foot_gap = max(gaps) if gaps else None
 
-    return Features(knee, hip, torso, wrist_above_hip, foot_above_knee)
+    return Features(knee, hip, torso, wrist_above_hip, foot_gap)
 
 
-def classify(f, base, ratio=1.0):
-    """base: (무릎, 엉덩이) 베이스라인 각도. ratio < 1 이면 기준을 느슨하게 적용."""
-    if f.foot_above_knee:
+def classify(f, base, ratio=1.0, foot_margin=FOOT_MARGIN):
+    """
+    base: (무릎, 엉덩이) 베이스라인 각도.
+    1차 판정은 ratio < 1, foot_margin < FOOT_MARGIN 으로 기준을 느슨하게 적용.
+    """
+    if f.foot_gap is not None and f.foot_gap >= foot_margin:
         return 'Jump'
     if base is None or f.knee is None:
         return 'Normal'

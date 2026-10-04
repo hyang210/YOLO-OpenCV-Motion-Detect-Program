@@ -15,6 +15,7 @@ FOOT_MARGIN = 0.02         # 발이 반대쪽 무릎보다 박스 높이의 몇 
 
 # 단계적 판정 설정
 SCREEN_RATIO = 0.7         # 1차(YOLO) 판정은 기준값의 70% 로 느슨하게 → 후보를 넉넉히 뽑음
+FOOT_SCREEN_MARGIN = -0.05 # 1차: 발이 반대쪽 무릎보다 박스 높이 5% 아래까지 올라오면 후보 → MediaPipe 로 확인
 MAX_MP_PER_FRAME = 3       # 프레임당 MediaPipe 호출 상한 (비용 상한)
 MIN_MP_BOX_H = 80          # 이보다 작은 박스는 MediaPipe 가 부정확하므로 YOLO 결과로 판정
 CROP_PAD = 0.2
