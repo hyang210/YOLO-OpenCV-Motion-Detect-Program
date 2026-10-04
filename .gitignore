@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 모델 가중치 (실행 시 자동 다운로드)
+*.pt
+
+# 실행 결과물
+event_log.txt
+*.log
+runs/
+
+# 입력 영상
+*.mp4
+*.avi
+*.mov
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
