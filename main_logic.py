@@ -4,7 +4,8 @@ YOLO-pose(기본 판정) + MediaPipe(의심 후보 정밀 확인) 기반 Jump/Cr
 흐름
   1. YOLO11-pose + ByteTrack 으로 모든 사람의 박스/ID/17개 keypoint 를 한 번에 추출
   2. ID 별 베이스라인(평상시 무릎/엉덩이 각도)과 비교해 느슨한 기준으로 1차 판정
-  3. 1차에서 걸린 후보만 MediaPipe(33개 keypoint, 발끝/뒤꿈치 포함)로 정밀 확인
+  3. 각도 변화는 YOLO 값으로 원래 기준 재판정, 발이 무릎 근처까지 올라온 후보만
+     MediaPipe(발끝/뒤꿈치 포함 33개 keypoint)로 발-무릎 높이를 정밀 확인
   4. 일정 시간 연속 확인되면 이벤트 확정 → 로그 (쿨다운 동안 중복 기록 X)
 
 설정값은 detector/config.py 에 있음
@@ -12,13 +13,14 @@ YOLO-pose(기본 판정) + MediaPipe(의심 후보 정밀 확인) 기반 Jump/Cr
 import argparse
 import logging
 import time
+from dataclasses import replace
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from detector.config import (CONF_THRES, MAX_MP_PER_FRAME, MIN_MP_BOX_H, NMS_THRES,
-                             SCREEN_RATIO, FrameParams)
+from detector.config import (CONF_THRES, FOOT_SCREEN_MARGIN, MAX_MP_PER_FRAME, MIN_MP_BOX_H,
+                             NMS_THRES, SCREEN_RATIO, FrameParams)
 from detector.confirmer import MediaPipeConfirmer
 from detector.features import YOLO_KP, classify, extract_features
 from detector.person_state import PersonState
@@ -107,22 +109,29 @@ def main():
                 f_yolo = extract_features(pts, conf, box[3] - box[1])
                 st.add_baseline(f_yolo)
 
-                if classify(f_yolo, st.baseline, SCREEN_RATIO) == 'Normal':
+                if classify(f_yolo, st.baseline, SCREEN_RATIO, FOOT_SCREEN_MARGIN) == 'Normal':
                     st.update('Normal')
                 else:
                     candidates.append((pid, box, f_yolo, st))
 
-            # 2차: 이미 연속 판정 중인 후보부터 MediaPipe 로 확인 (예산 초과·실패 시 YOLO + 원래 기준)
+            # 2차: 원래 기준으로 최종 판정.
+            #  - 각도 변화: 베이스라인과 같은 모델인 YOLO 값으로만 비교 (모델 간 관절 위치 차이 배제)
+            #  - 발-무릎 높이: 발이 무릎 근처면 MediaPipe 발끝/뒤꿈치 값으로 교체
+            #    (이미 연속 판정 중인 후보부터, 예산 초과·실패·다른 사람 검출 시 YOLO 값 유지)
             candidates.sort(key=lambda c: c[3].streak, reverse=True)
-            for n, (pid, box, f_yolo, st) in enumerate(candidates):
+            mp_budget = MAX_MP_PER_FRAME
+            for pid, box, f_yolo, st in candidates:
                 box_h = box[3] - box[1]
-                label = None
-                if n < MAX_MP_PER_FRAME and box_h >= MIN_MP_BOX_H:
+                f_final = f_yolo
+                near_knee = f_yolo.foot_gap is not None and f_yolo.foot_gap >= FOOT_SCREEN_MARGIN
+                if near_knee and mp_budget > 0 and box_h >= MIN_MP_BOX_H:
+                    mp_budget -= 1
                     lm = confirmer.landmarks(frame, box)
                     if lm is not None:
-                        label = classify(extract_features(*lm, box_h), st.baseline)
-                if label is None:
-                    label = classify(f_yolo, st.baseline)
+                        f_mp = extract_features(*lm, box_h)
+                        if f_mp.foot_gap is not None:
+                            f_final = replace(f_yolo, foot_gap=f_mp.foot_gap)
+                label = classify(f_final, st.baseline)
 
                 event = st.update(label)
                 if event and st.should_log(event, frame_num):
