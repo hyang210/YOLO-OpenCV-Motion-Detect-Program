@@ -1,400 +1,361 @@
-import cv2
+"""
+YOLO-pose(기본 판정) + MediaPipe(의심 후보 정밀 확인) 기반 Jump/Crawl 탐지
+
+흐름
+  1. YOLO11-pose + ByteTrack 으로 모든 사람의 박스/ID/17개 keypoint 를 한 번에 추출
+  2. ID 별 베이스라인(평상시 무릎/엉덩이 각도)과 비교해 느슨한 기준으로 1차 판정
+  3. 1차에서 걸린 후보만 MediaPipe(33개 keypoint, 발끝/뒤꿈치 포함)로 정밀 확인
+  4. CONFIRM_FRAMES 프레임 연속 확인되면 이벤트 확정 → 로그 (쿨다운 동안 중복 기록 X)
+"""
+from __future__ import annotations
+
+import argparse
+import logging
 import math
-import datetime
+import time
+from dataclasses import dataclass, field
+
+import cv2
 import mediapipe as mp
 import numpy as np
 from ultralytics import YOLO
-from concurrent.futures import ThreadPoolExecutor
 
-# YOLO 모델 및 임계값 설정
-MODEL_PATH = 'C:/pythonPractice/yolo11m.pt'
+# YOLO 임계값
 CONF_THRES = 0.5
 NMS_THRES = 0.4
+KP_CONF = 0.5              # keypoint 신뢰도(YOLO conf / MediaPipe visibility) 최소값
 
-# 점프 및 기기 동작 탐지를 위한 기준값 설정
-THETA = 80.0
-FOOT_OFF = 15
-CRAWL_KNEE_HIP = 30.0
-CRAWL_PELVIS_DROP = 10
-CRAWL_TORSO_TH = 60.0
+# 동작 판정 기준값 (베이스라인 대비 각도 변화량, 단위: 도)
+THETA = 80.0               # Jump: 무릎 각도 변화
+CRAWL_KNEE = 30.0          # Crawl: 무릎 각도 변화
+CRAWL_HIP = 10.0           # Crawl: 엉덩이 각도 변화
+CRAWL_TORSO = 60.0         # Crawl: 상체가 수직에서 기울어진 각도
+FOOT_MARGIN = 0.02         # 발이 반대쪽 무릎보다 박스 높이의 몇 % 이상 위에 있어야 하는지
 
-# 추적자 및 ID 초기화
-trackers = {}
-next_id = 0
-model = YOLO(MODEL_PATH)
+# 단계적 판정 설정
+SCREEN_RATIO = 0.7         # 1차(YOLO) 판정은 기준값의 70% 로 느슨하게 → 후보를 넉넉히 뽑음
+BASELINE_FRAMES = 30       # ID 별 베이스라인 수집 프레임 수
+CONFIRM_FRAMES = 3         # 연속 확인 프레임 수
+COOLDOWN_FRAMES = 90       # 같은 ID, 같은 이벤트 재기록 금지 프레임 수
+STALE_FRAMES = 60          # 이 프레임 수 동안 안 보인 ID 는 상태 삭제
+MAX_MP_PER_FRAME = 3       # 프레임당 MediaPipe 호출 상한 (비용 상한)
+MIN_MP_BOX_H = 80          # 이보다 작은 박스는 MediaPipe 가 부정확하므로 YOLO 결과로 판정
+CROP_PAD = 0.2
 
+# keypoint 인덱스 (YOLO: COCO 17점, MediaPipe: 33점)
+YOLO_KP = {
+    'l_shoulder': 5, 'r_shoulder': 6, 'l_wrist': 9, 'r_wrist': 10,
+    'l_hip': 11, 'r_hip': 12, 'l_knee': 13, 'r_knee': 14, 'l_ankle': 15, 'r_ankle': 16,
+}
+MP_KP = {
+    'l_shoulder': 11, 'r_shoulder': 12, 'l_wrist': 15, 'r_wrist': 16,
+    'l_hip': 23, 'r_hip': 24, 'l_knee': 25, 'r_knee': 26, 'l_ankle': 27, 'r_ankle': 28,
+    'l_heel': 29, 'r_heel': 30, 'l_foot': 31, 'r_foot': 32,
+}
+COCO_EDGES = [(5, 6), (5, 7), (7, 9), (6, 8), (8, 10), (5, 11), (6, 12),
+              (11, 12), (11, 13), (13, 15), (12, 14), (14, 16)]
+STATUS_COLOR = {'Normal': (0, 255, 0), 'Jump': (0, 0, 255), 'Crawl': (255, 0, 0)}
 
-# 사람 외 영역에 흐림 효과 적용 함수
-def apply_blur_to_background(frame, boxes):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (1, 1), 0)
-    blurred_color = cv2.cvtColor(blurred, cv2.COLOR_GRAY2BGR)
-    for (x1, y1, x2, y2) in boxes:
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-        blurred_color[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
-    return blurred_color
-
-
-# IOU 계산 함수
-def IOU(box1, box2):
-    x1, y1, x2, y2 = box1
-    x_1, y_1, x_2, y_2 = box2
-    xi1, yi1 = max(x1, x_1), max(y1, y_1)
-    xi2, yi2 = min(x2, x_2), min(y2, y_2)
-    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-    union_area = (x2 - x1) * (y2 - y1) + (x_2 - x_1) * (y_2 - y_1) - inter_area
-    return inter_area / union_area if union_area > 0 else 0
-
-
-# NMS (Non-Maximum Suppression) 함수
-def non_max_suppression_persons(boxes, threshold=0.4):
-    boxes = sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
-    selected = []
-    for box in boxes:
-        if all(IOU(box, s) < threshold for s in selected):
-            selected.append(box)
-    return selected
+logger = logging.getLogger('events')
 
 
-# MediaPipe를 이용한 포즈 각도 계산 클래스
-class PoseAngleEstimator:
-    def __init__(self):
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            min_detection_confidence=0.5,
-            enable_segmentation=False
-        )
-        self.mp_drawing = mp.solutions.drawing_utils
+# ---------------------------------------------------------------- 특징 계산
 
-    def calculate_angle(self, a, b, c):
-        ba = [a[0] - b[0], a[1] - b[1]]
-        bc = [c[0] - b[0], c[1] - b[1]]
-        dot_product = ba[0] * bc[0] + ba[1] * bc[1]
-        magnitude_ba = math.hypot(*ba)
-        magnitude_bc = math.hypot(*bc)
-
-        if magnitude_ba == 0 or magnitude_bc == 0:
-            return 0.0
-
-        angle_rad = math.acos(dot_product / (magnitude_ba * magnitude_bc))
-        return math.degrees(angle_rad)
-
-    def extract_landmark(self, landmarks, idx, image_shape):
-        h, w = image_shape
-        try:
-            landmark = landmarks[idx]
-            return (int(landmark.x * w), int(landmark.y * h))
-        except IndexError:
-            return (0, 0)
-
-    def process_frame(self, frame):
-        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.pose.process(image_rgb)
-
-        if results.pose_landmarks:
-            self.mp_drawing.draw_landmarks(
-                frame,
-                results.pose_landmarks,
-                self.mp_pose.POSE_CONNECTIONS
-            )
-            landmarks = results.pose_landmarks.landmark
-            h, w, _ = frame.shape
-
-            hip = self.extract_landmark(landmarks, self.mp_pose.PoseLandmark.LEFT_HIP.value, (h, w))
-            knee = self.extract_landmark(landmarks, self.mp_pose.PoseLandmark.LEFT_KNEE.value, (h, w))
-            ankle = self.extract_landmark(landmarks, self.mp_pose.PoseLandmark.LEFT_ANKLE.value, (h, w))
-            shoulder = self.extract_landmark(landmarks, self.mp_pose.PoseLandmark.LEFT_SHOULDER.value, (h, w))
-            vertical = (hip[0], hip[1] - 10)
-
-            knee_angle = self.calculate_angle(hip, knee, ankle)
-            hip_angle = self.calculate_angle(shoulder, hip, knee)
-            vertical_angle = self.calculate_angle(vertical, hip, knee)
-
-            print(f"knee angle : {knee_angle}")
-            print(f"hip angle : {hip_angle}")
-            print(f"vertical_angle : {vertical_angle}")
-
-            return frame, results
+@dataclass
+class Features:
+    knee: float | None          # 무릎 각도 (엉덩이-무릎-발목)
+    hip: float | None           # 엉덩이 각도 (어깨-엉덩이-무릎)
+    torso: float | None         # 상체가 수직에서 기울어진 각도
+    wrist_above_hip: bool
+    foot_above_knee: bool
 
 
-# 한 명의 사람에 대해 동작을 분석하고 결과 리턴
-def process_person(crop_img, box, frame_num, person_id, estimator, baseline, frame, offset):
-    offset_x, offset_y = offset
+def calculate_angle(a, b, c):
+    ba = (a[0] - b[0], a[1] - b[1])
+    bc = (c[0] - b[0], c[1] - b[1])
+    mag = math.hypot(*ba) * math.hypot(*bc)
+    if mag == 0:
+        return 0.0
+    cos = (ba[0] * bc[0] + ba[1] * bc[1]) / mag
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos))))
 
-    with mp.solutions.pose.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-    ) as pose:
 
-        results = pose.process(cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB))
+def extract_features(pts, conf, box_h):
+    """pts/conf: {이름: (x, y)} / {이름: 신뢰도}. YOLO, MediaPipe 공통으로 사용."""
+    ok = lambda name: name in pts and conf[name] >= KP_CONF
 
-    if not results.pose_landmarks:
+    # 좌우 중 더 잘 보이는 쪽으로 각도 계산
+    side_score = {s: min(conf[f'{s}_{p}'] for p in ('shoulder', 'hip', 'knee', 'ankle'))
+                  for s in ('l', 'r')}
+    s = max(side_score, key=side_score.get)
+    knee = hip = torso = None
+    wrist_above_hip = False
+    if side_score[s] >= KP_CONF:
+        sh, hp, kn, an = (pts[f'{s}_{p}'] for p in ('shoulder', 'hip', 'knee', 'ankle'))
+        knee = calculate_angle(hp, kn, an)
+        hip = calculate_angle(sh, hp, kn)
+        torso = calculate_angle(sh, hp, (hp[0], hp[1] - 10))
+        # 이미지 좌표는 y 가 아래로 커지므로 '위' 는 y 가 더 작은 것
+        wrist_above_hip = any(ok(w) and pts[w][1] < hp[1] for w in ('l_wrist', 'r_wrist'))
+
+    # 한쪽 발(발목/뒤꿈치/발끝 중 가장 높은 점)이 반대쪽 무릎보다 위인지
+    def foot_top(side):
+        ys = [pts[n][1] for n in (f'{side}_ankle', f'{side}_heel', f'{side}_foot') if ok(n)]
+        return min(ys) if ys else None
+
+    margin = FOOT_MARGIN * box_h
+    foot_above_knee = False
+    for foot_side, knee_side in (('l', 'r'), ('r', 'l')):
+        fy = foot_top(foot_side)
+        if fy is not None and ok(f'{knee_side}_knee') and fy < pts[f'{knee_side}_knee'][1] - margin:
+            foot_above_knee = True
+
+    return Features(knee, hip, torso, wrist_above_hip, foot_above_knee)
+
+
+def classify(f, base, ratio=1.0):
+    if f.foot_above_knee:
+        return 'Jump'
+    if base is None or f.knee is None:
+        return 'Normal'
+    dk = abs(f.knee - base[0])
+    dh = abs(f.hip - base[1])
+    if dk >= THETA * ratio and f.wrist_above_hip:
+        return 'Jump'
+    if dk >= CRAWL_KNEE * ratio and dh >= CRAWL_HIP * ratio and f.torso >= CRAWL_TORSO * ratio:
+        return 'Crawl'
+    return 'Normal'
+
+
+# ---------------------------------------------------------------- 사람별 상태
+
+@dataclass
+class PersonState:
+    sum_knee: float = 0.0
+    sum_hip: float = 0.0
+    n_base: int = 0
+    streak_label: str = 'Normal'
+    streak: int = 0
+    status: str = 'Normal'
+    last_seen: int = 0
+    last_event: dict = field(default_factory=dict)
+
+    @property
+    def baseline(self):
+        if self.n_base < BASELINE_FRAMES:
+            return None
+        return self.sum_knee / self.n_base, self.sum_hip / self.n_base
+
+    def add_baseline(self, f):
+        if self.n_base < BASELINE_FRAMES and f.knee is not None and not f.foot_above_knee:
+            self.sum_knee += f.knee
+            self.sum_hip += f.hip
+            self.n_base += 1
+
+    def update(self, label):
+        """연속 프레임 확인. 확정된 이벤트면 이벤트명을, 아니면 None 을 반환."""
+        if label == 'Normal':
+            self.streak_label, self.streak, self.status = 'Normal', 0, 'Normal'
+            return None
+        self.streak = self.streak + 1 if label == self.streak_label else 1
+        self.streak_label = label
+        if self.streak >= CONFIRM_FRAMES:
+            self.status = label
+            return label
         return None
 
-    # 스켈레톤 그리기
-    if results.pose_landmarks:
-        estimator.mp_drawing.draw_landmarks(
-            crop_img,
-            results.pose_landmarks,
-            estimator.mp_pose.POSE_CONNECTIONS
-        )
 
-        # 전체 프레임 기준으로 keypoint 좌표 보정 후 프레임에 그림
-        h_crop, w_crop, _ = crop_img.shape
-        lm = results.pose_landmarks.landmark
-        # visibility < 0.5 인 경우에는 unreliable 한 좌표이므로 skip
-        required = [estimator.mp_pose.PoseLandmark.LEFT_HIP,
-                    estimator.mp_pose.PoseLandmark.LEFT_KNEE,
-                    estimator.mp_pose.PoseLandmark.LEFT_ANKLE]
+# ---------------------------------------------------------------- MediaPipe 확인기
 
-        if any(lm[p].visibility < 0.5 for p in required):  # 추가된 내용. 정확도가 떨어지면 mediapipe 표시하지 않기
+class MediaPipeConfirmer:
+    """후보가 처음 생길 때만 모델을 로드. 단일 인스턴스를 메인 스레드에서만 사용."""
+
+    def __init__(self, complexity):
+        self.complexity = complexity
+        self._pose = None
+        self.calls = 0
+
+    def landmarks(self, frame, box):
+        if self._pose is None:
+            self._pose = mp.solutions.pose.Pose(
+                static_image_mode=True,       # 후보일 때만 띄엄띄엄 호출하므로 추적 모드 X
+                model_complexity=self.complexity,
+                enable_segmentation=False,
+                min_detection_confidence=0.5,
+            )
+        x1, y1, x2, y2 = box
+        dx, dy = int((x2 - x1) * CROP_PAD), int((y2 - y1) * CROP_PAD)
+        xA, yA = max(0, x1 - dx), max(0, y1 - dy)
+        xB, yB = min(frame.shape[1], x2 + dx), min(frame.shape[0], y2 + dy)
+        if xB <= xA or yB <= yA:
             return None
 
-        keypoints = []
-        for pt in lm:
-            x = int(pt.x * w_crop) + offset_x
-            y = int(pt.y * h_crop) + offset_y
-            keypoints.append((x, y))
-            if 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
-                cv2.circle(frame, (x, y), 3, (0, 0, 255), -1)
-
-        for start_idx, end_idx in estimator.mp_pose.POSE_CONNECTIONS:
-            if keypoints[start_idx] != (0, 0) and keypoints[end_idx] != (0, 0):
-                cv2.line(frame, keypoints[start_idx], keypoints[end_idx], (255, 255, 255), 2)
-
-        lm = results.pose_landmarks.landmark
-        h, w, _ = crop_img.shape
-        px = lambda pt: (pt.x * w, pt.y * h)
-
-        hip = px(lm[estimator.mp_pose.PoseLandmark.LEFT_HIP])
-        left_knee = px(lm[estimator.mp_pose.PoseLandmark.LEFT_KNEE])
-        left_ankle = px(lm[estimator.mp_pose.PoseLandmark.LEFT_ANKLE])
-        left_wrist = px(lm[estimator.mp_pose.PoseLandmark.LEFT_WRIST])
-        right_ankle = px(lm[estimator.mp_pose.PoseLandmark.RIGHT_ANKLE])
-        right_knee = px(lm[estimator.mp_pose.PoseLandmark.RIGHT_KNEE])
-
-        shoulder = px(lm[estimator.mp_pose.PoseLandmark.LEFT_SHOULDER])
-        vertical = (hip[0], hip[1] - 10)
-
-        knee_ang = estimator.calculate_angle(hip, left_knee, left_ankle)
-        hip_ang = estimator.calculate_angle(shoulder, hip, left_knee)
-        torso_ang = estimator.calculate_angle(shoulder, hip, vertical)
-
-        # 베이스라인 수집
-        if frame_num <= 30:
-            baseline['sum_knee'] += knee_ang
-            baseline['sum_hip'] += hip_ang
-            baseline['sum_ankle'] += left_ankle[1]
-            baseline['count'] += 1
+        crop = frame[yA:yB, xA:xB]
+        self.calls += 1
+        res = self._pose.process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+        if not res.pose_landmarks:
             return None
 
-        if baseline['count'] >= 30 and not baseline.get('initialized'):
-            baseline['knee'] = baseline['sum_knee'] / baseline['count']
-            baseline['hip'] = baseline['sum_hip'] / baseline['count']
-            baseline['ankle'] = baseline['sum_ankle'] / baseline['count']
-            baseline['initialized'] = True
+        lm = res.pose_landmarks.landmark
+        cw, ch = xB - xA, yB - yA
+        pts = {n: (xA + lm[i].x * cw, yA + lm[i].y * ch) for n, i in MP_KP.items()}
+        conf = {n: lm[i].visibility for n, i in MP_KP.items()}
+        return pts, conf
 
-        if not baseline.get('initialized'):
-            return {
-                'box': box,
-                'person_id': person_id,
-                'status': 'Normal',
-                'crop_img': crop_img
-            }
-
-        # 동작 판단
-        delta_k = abs(knee_ang - baseline['knee'])
-        delta_h = abs(hip_ang - baseline['hip'])
-        delta_a = abs(left_ankle[1] - baseline['ankle'])
-        hand_above_hip = (left_wrist[1] > hip[1])
-        foot_above_knee = (right_ankle[1] < left_knee[1]) or (left_ankle[1] < right_knee[1])
-
-        if (delta_k >= THETA and hand_above_hip) or foot_above_knee:
-            log_event("Jump", frame_num, person_id, knee_ang, hip_ang, delta_k)
-            status = "Jump"
-        elif delta_k >= CRAWL_KNEE_HIP and delta_h >= CRAWL_PELVIS_DROP and torso_ang >= CRAWL_TORSO_TH:
-            log_event("Crawl", frame_num, person_id, knee_ang, hip_ang, delta_k)
-            status = "Crawl"
-        else:
-            status = "Normal"
-
-        if status != "Normal":
-            log_event(status, frame_num, person_id, knee_ang, hip_ang, delta_k)
-
-        keypoints = {
-            'LEFT_HIP': hip,
-            'LEFT_KNEE': left_knee,
-            'LEFT_ANKLE': left_ankle,
-            'LEFT_SHOULDER': shoulder
-        }
-
-        return {
-            'box': box,
-            'person_id': person_id,
-            'status': status,
-            'crop_img': crop_img
-        }
+    def close(self):
+        if self._pose is not None:
+            self._pose.close()
 
 
-# 로그 기록 함수
-def log_event(event_type, frame_num, person_id, knee_ang, hip_ang, score):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open("event_log.txt", "a") as f:
-        f.write(
-            f"[{timestamp}] Frame {frame_num} | Person {person_id}: {event_type} - Knee={knee_ang:.1f}, Hip={hip_ang:.1f}, Score={score:.1f}\n")
+# ---------------------------------------------------------------- 그리기
+
+def blur_background(frame, boxes):
+    # 축소 → 블러 → 확대 : 전체 해상도 블러보다 훨씬 가벼움
+    h, w = frame.shape[:2]
+    small = cv2.resize(frame, (w // 4, h // 4))
+    out = cv2.resize(cv2.GaussianBlur(small, (0, 0), 4), (w, h))
+    for x1, y1, x2, y2 in boxes:
+        x1, y1 = max(0, x1), max(0, y1)
+        out[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+    return out
 
 
-# 메인 함수
+def draw_skeleton(img, kxy, kconf):
+    for a, b in COCO_EDGES:
+        if kconf[a] >= KP_CONF and kconf[b] >= KP_CONF:
+            cv2.line(img, tuple(map(int, kxy[a])), tuple(map(int, kxy[b])), (255, 255, 255), 2)
+    for (x, y), c in zip(kxy, kconf):
+        if c >= KP_CONF:
+            cv2.circle(img, (int(x), int(y)), 3, (0, 0, 255), -1)
+
+
+# ---------------------------------------------------------------- 메인
+
+def parse_args():
+    p = argparse.ArgumentParser(description='YOLO-pose + MediaPipe Jump/Crawl 탐지')
+    p.add_argument('--source', default='sample.mp4', help='영상 경로 또는 웹캠 번호')
+    p.add_argument('--model', default='yolo11n-pose.pt', help='YOLO pose 모델 (n/s/m...)')
+    p.add_argument('--imgsz', type=int, default=640)
+    p.add_argument('--mp-complexity', type=int, default=1, choices=(0, 1, 2),
+                   help='MediaPipe 모델 크기 (0=lite, 가장 가벼움)')
+    p.add_argument('--log', default='event_log.txt')
+    p.add_argument('--blur', action='store_true', help='사람 외 배경 블러')
+    p.add_argument('--skeleton', action='store_true', help='YOLO 스켈레톤 표시')
+    p.add_argument('--no-show', action='store_true', help='화면 출력 없이 실행')
+    return p.parse_args()
+
+
+def setup_logger(path):
+    handler = logging.FileHandler(path, encoding='utf-8')
+    handler.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(handler)
+    logger.addHandler(logging.StreamHandler())
+    logger.setLevel(logging.INFO)
+
+
 def main():
-    global next_id, trackers
-    video_path = 'C:/pythonPractice/sample.mp4'
-    cap = cv2.VideoCapture(video_path)
+    args = parse_args()
+    setup_logger(args.log)
 
+    source = int(args.source) if args.source.isdigit() else args.source
+    cap = cv2.VideoCapture(source)
     if not cap.isOpened():
-        print("영상 파일 열기 실패.")
+        print(f'영상 열기 실패: {args.source}')
         return
 
-    estimator = PoseAngleEstimator()
-    baseline = {'sum_knee': 0, 'sum_hip': 0, 'sum_ankle': 0, 'count': 0}
+    model = YOLO(args.model)
+    confirmer = MediaPipeConfirmer(args.mp_complexity)
+    states: dict[int, PersonState] = {}
     frame_num = 0
-    executor = ThreadPoolExecutor(max_workers=4)
+    fps_ema = None
+    t_start = time.perf_counter()
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret or frame is None or frame.size == 0:
-            print("프레임 읽기 실패")
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None or frame.size == 0:
+                break
+            t0 = time.perf_counter()
+            frame_num += 1
 
-        frame_num += 1
-        keypoint_futures = []
+            r = model.track(frame, persist=True, classes=[0], conf=CONF_THRES, iou=NMS_THRES,
+                            imgsz=args.imgsz, tracker='bytetrack.yaml', verbose=False)[0]
 
-        results = model.predict(frame, conf=CONF_THRES, iou=NMS_THRES, verbose=False)[0]
-        boxes = []
+            people = []  # (id, box, kxy, kconf)
+            if r.boxes.id is not None and r.keypoints is not None:
+                ids = r.boxes.id.int().tolist()
+                boxes = r.boxes.xyxy.int().tolist()
+                kxy = r.keypoints.xy.cpu().numpy()
+                kconf = (r.keypoints.conf.cpu().numpy() if r.keypoints.conf is not None
+                         else np.ones(kxy.shape[:2], dtype=np.float32))
+                people = list(zip(ids, boxes, kxy, kconf))
 
-        for box in results.boxes:
-            cls_id = int(box.cls[0])
-            if model.names[cls_id].lower() == 'person':
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                boxes.append((x1, y1, x2, y2))
+            mp_budget = MAX_MP_PER_FRAME
+            for pid, box, kp_xy, kp_conf in people:
+                st = states.setdefault(pid, PersonState())
+                st.last_seen = frame_num
+                box_h = box[3] - box[1]
 
-        filtered_boxes = non_max_suppression_persons(boxes)
-        frame = apply_blur_to_background(frame, filtered_boxes)
+                pts = {n: tuple(kp_xy[i]) for n, i in YOLO_KP.items()}
+                conf = {n: float(kp_conf[i]) for n, i in YOLO_KP.items()}
+                f_yolo = extract_features(pts, conf, box_h)
+                st.add_baseline(f_yolo)
+                base = st.baseline
 
-        for (x1, y1, x2, y2) in boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
-            cv2.putText(frame, "person", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                # 1차: YOLO, 느슨한 기준
+                if classify(f_yolo, base, SCREEN_RATIO) == 'Normal':
+                    st.update('Normal')
+                    continue
 
-        updated_trackers = {}
-        used_ids = set()
+                # 2차: 후보만 MediaPipe 로 정밀 확인 (불가하면 YOLO + 원래 기준으로 판정)
+                label = None
+                if mp_budget > 0 and box_h >= MIN_MP_BOX_H:
+                    mp_budget -= 1
+                    lm = confirmer.landmarks(frame, box)
+                    if lm is not None:
+                        label = classify(extract_features(*lm, box_h), base)
+                if label is None:
+                    label = classify(f_yolo, base)
 
-        new_trackers = {}
-        matched_id = set()
+                event = st.update(label)
+                if event and frame_num - st.last_event.get(event, -COOLDOWN_FRAMES) >= COOLDOWN_FRAMES:
+                    st.last_event[event] = frame_num
+                    knee = f'{f_yolo.knee:.1f}' if f_yolo.knee is not None else '-'
+                    hip = f'{f_yolo.hip:.1f}' if f_yolo.hip is not None else '-'
+                    logger.info(f'Frame {frame_num} | Person {pid}: {event} - Knee={knee}, Hip={hip}')
 
-        for box in filtered_boxes:
-            best_iou = 0
-            matched = None
-            for pid, prev_box in trackers.items():
-                iou = IOU(box, prev_box)
-                if iou > best_iou:
-                    best_iou = iou
-                    matched = pid
-            if best_iou > 0.4 and matched not in matched_id:
-                new_trackers[matched] = box
-                matched_id.add(matched)
-            else:
-                new_trackers[next_id] = box
-                matched_id.add(next_id)
-                next_id += 1
+            for pid in [p for p, s in states.items() if frame_num - s.last_seen > STALE_FRAMES]:
+                del states[pid]
 
-        trackers = new_trackers
+            dt = time.perf_counter() - t0
+            fps_ema = 1 / dt if fps_ema is None else fps_ema * 0.9 + (1 / dt) * 0.1
 
-        futures = []
+            if not args.no_show:
+                vis = blur_background(frame, [p[1] for p in people]) if args.blur else frame.copy()
+                for pid, (x1, y1, x2, y2), kp_xy, kp_conf in people:
+                    status = states[pid].status
+                    color = STATUS_COLOR[status]
+                    thick = 1 if status == 'Normal' else 3
+                    if args.skeleton:
+                        draw_skeleton(vis, kp_xy, kp_conf)
+                    cv2.rectangle(vis, (x1, y1), (x2, y2), color, thick)
+                    cv2.putText(vis, f'ID {pid} | {status}', (x1, y1 - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.putText(vis, f'FPS {fps_ema:.1f}  MP calls {confirmer.calls}', (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.imshow('YOLO-pose + MediaPipe Jump/Crawl', vis)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        confirmer.close()
 
-        for person_id, (x1, y1, x2, y2) in trackers.items():
-            pad = 0.4
-            dx, dy = int((x2 - x1) * pad), int((y2 - y1) * pad)
-            xA, yA = max(0, x1 - dx), max(0, y1 - dy)
-            xB, yB = min(frame.shape[1], x2 + dx), min(frame.shape[0], y2 + dy)
-
-            if xB <= xA or yB <= yA:
-                continue
-
-            area = (xB - xA) * (yB - yA)
-            if area < 6400:
-                continue
-
-            crop = frame[yA:yB, xA:xB].copy()
-
-            if (yB - yA) / frame.shape[0] < 0.1 or (xB - xA) / frame.shape[1] < 0.03:
-                continue
-
-            future = executor.submit(
-                process_person,
-                crop,
-                (x1, y1, x2, y2),
-                frame_num,
-                person_id,
-                estimator,
-                baseline,
-                frame,
-                (xA, yA)
-            )
-            futures.append(future)
-
-        for future in futures:
-            # 오류 원인 탐지 코드 ----
-            try:
-                result = future.result()
-            except Exception as e:
-                # 이 줄이 없으면 여기서 터진 예외는 잡히지 않고 프로그램 전체가 꺼집니다.
-                print(f"[Error] process_person 에러: {e}")
-                continue
-            # -----여기까지------
-            if result is not None:
-                x1, y1, x2, y2 = result['box']
-                label = f"ID {result['person_id']} | {result['status']}"
-
-                if result is not None:
-                    x1, y1, x2, y2 = result['box']
-                    person_id = result['person_id']
-                    status = result['status']
-                    label = f"ID {person_id} | {status}"
-
-                    if status == 'Jump':
-                        color, thickness = (0, 0, 255), 3
-                    elif status == 'Crawl':
-                        color, thickness = (255, 0, 0), 3
-                    else:
-                        continue
-
-                if result['status'] == 'Normal' and 'crop_img' in result:
-                    pad = 0.4
-                    dx, dy = int((x2 - x1) * pad), int((y2 - y1) * pad)
-                    xA, yA = max(0, x1 - dx), max(0, y1 - dy)
-                    xB, yB = min(frame.shape[1], x2 + dx), min(frame.shape[0], y2 + dy)
-                if (result['crop_img'].shape[0] == (yB - yA)
-                    and result['crop_img'].shape[1] == (xB - xA)):
-                    frame[yA:yB, xA:xB] = result['crop_img']
-
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-                cv2.putText(frame, label, (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-        cv2.imshow("YOLO + MediaPipe + Jump/Crawl", frame)
-
-        if cv2.waitKey(30) & 0xFF == ord('q'):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    executor.shutdown()
-    print("완료. 로그는 event_log.txt에 저장.")
+    elapsed = time.perf_counter() - t_start
+    if frame_num:
+        print(f'완료: {frame_num} 프레임, 평균 {frame_num / elapsed:.1f} FPS, '
+              f'MediaPipe 호출 {confirmer.calls}회 ({confirmer.calls / frame_num:.2f}/프레임). '
+              f'로그는 {args.log}에 저장.')
 
 
 if __name__ == '__main__':
